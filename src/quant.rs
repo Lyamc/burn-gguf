@@ -687,7 +687,7 @@ pub(crate) fn q5_0_plane(block: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use alloc::vec;
-    use burn_tensor::quantization::{QuantLevel, QuantParam, QuantStore, QuantValue};
+    use burn_tensor::quantization::{QuantStore, QuantValue, ScaleDtype};
 
     fn f16_bytes(value: f32) -> [u8; 2] {
         half::f16::from_f32(value).to_le_bytes()
@@ -1336,8 +1336,7 @@ mod tests {
         let scheme = QuantScheme::default()
             .with_value(QuantValue::Q4F)
             .with_store(QuantStore::PackedU32(0))
-            .with_level(QuantLevel::block([32]))
-            .with_param(QuantParam::F16);
+            .per_block([32], ScaleDtype::F16);
 
         let mut data = Vec::new();
         data.extend_from_slice(&f16_bytes(1.0));

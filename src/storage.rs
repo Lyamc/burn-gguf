@@ -1,8 +1,9 @@
 //! Backing storage for a GGUF file, and the zero-copy slice path.
 
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 #[cfg(all(feature = "std", feature = "memmap"))]
 use burn_tensor::AllocationProperty;
+use burn_std::SplitPolicy;
 use burn_tensor::Bytes;
 
 #[cfg(feature = "std")]
@@ -19,7 +20,7 @@ pub(crate) enum Storage {
     /// `Bytes` is backed by a refcounted `bytes::Bytes` when it was built with
     /// [`Bytes::from_shared`], so [`Storage::slice`] is a refcount bump rather than a
     /// memcpy.
-    Memory(Rc<Bytes>),
+    Memory(Arc<Bytes>),
     /// A file opened for buffered reads, used when memory-mapping is unavailable.
     ///
     /// Only constructed when the memmap feature is off, so with the default features
@@ -27,7 +28,7 @@ pub(crate) enum Storage {
     #[cfg(feature = "std")]
     #[cfg_attr(feature = "memmap", allow(dead_code))]
     Buffered {
-        file: Rc<std::cell::RefCell<std::fs::File>>,
+        file: Arc<std::sync::Mutex<std::fs::File>>,
     },
 }
 
@@ -42,7 +43,13 @@ impl core::fmt::Debug for Storage {
             #[cfg(feature = "std")]
             Self::Buffered { file } => f
                 .debug_struct("Buffered")
-                .field("len", &file.borrow().metadata().ok().map(|m| m.len()))
+                .field(
+                    "len",
+                    &file
+                        .lock()
+                        .ok()
+                        .and_then(|file| file.metadata().ok().map(|meta| meta.len())),
+                )
                 .finish_non_exhaustive(),
         }
     }
@@ -51,7 +58,7 @@ impl core::fmt::Debug for Storage {
 impl Storage {
     /// Wrap an already-resident buffer, enabling zero-copy slices.
     pub(crate) fn from_bytes(bytes: Bytes) -> Self {
-        Self::Memory(Rc::new(bytes))
+        Self::Memory(Arc::new(bytes))
     }
 
     /// Memory-map a file, enabling zero-copy slices.
@@ -100,7 +107,7 @@ impl Storage {
             GgufError::Io(format!("failed to open {}: {error}", path.display()))
         })?;
         Ok(Self::Buffered {
-            file: Rc::new(std::cell::RefCell::new(file)),
+            file: Arc::new(std::sync::Mutex::new(file)),
         })
     }
 
@@ -110,11 +117,9 @@ impl Storage {
         match self {
             Self::Memory(bytes) => Some(bytes.len()),
             #[cfg(feature = "std")]
-            Self::Buffered { file } => file
-                .borrow()
-                .metadata()
-                .ok()
-                .map(|meta| meta.len() as usize),
+            Self::Buffered { file } => file.lock().ok().and_then(|file| {
+                file.metadata().ok().map(|meta| meta.len() as usize)
+            }),
         }
     }
 
@@ -154,7 +159,9 @@ impl Storage {
             }
             Self::Buffered { file } => {
                 use std::io::{Read, Seek, SeekFrom};
-                let mut file = file.borrow_mut();
+                let mut file = file.lock().map_err(|_| {
+                    GgufError::Io("the GGUF file lock was poisoned".into())
+                })?;
                 file.seek(SeekFrom::Start(offset as u64)).map_err(|error| {
                     GgufError::Io(format!("failed to seek to {offset}: {error}"))
                 })?;
@@ -182,8 +189,9 @@ impl Storage {
                     return None;
                 }
                 // `split` twice yields the middle as its own refcounted allocation.
-                let (_, right) = Bytes::clone(bytes).split(start).ok()?;
-                let (middle, _) = right.split(end - start).ok()?;
+                // Shared keeps the mapped file as a view; these slices are read-only.
+                let (_, right) = Bytes::clone(bytes).split(start, SplitPolicy::Shared).ok()?;
+                let (middle, _) = right.split(end - start, SplitPolicy::Shared).ok()?;
                 Some(middle)
             }
             #[cfg(feature = "std")]

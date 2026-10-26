@@ -2,10 +2,11 @@
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use burn_store::{TensorSnapshot, TensorSnapshotError};
+use burn_store::burn_pack::{Error as PackError, Tensor as PackTensor};
+use burn_store::{ModuleAdapter, ModuleContext};
 use burn_tensor::DType;
 
 use crate::base::GgufError;
@@ -169,19 +170,19 @@ impl GgufAdapter {
         Some(renamed)
     }
 
-    /// Build the snapshot a Burn module will consume for one GGUF tensor.
+    /// Build the tensor a Burn module will consume for one GGUF tensor.
     ///
     /// The payload is produced inside the closure so a tensor the module never visits is
     /// never decoded. For a quantized model that is the difference between reading a few
     /// thousand descriptors and expanding the whole file.
     ///
-    /// `reader` is shared rather than borrowed because a [`TensorSnapshot`] holds a
-    /// `'static` closure, and a mapped file is worth keeping alive rather than copying.
-    pub(crate) fn snapshot(
+    /// `reader` is shared rather than borrowed because a [`PackTensor`] holds a `'static`
+    /// closure, and a mapped file is worth keeping alive rather than copying.
+    pub(crate) fn tensor(
         &self,
-        reader: &Rc<GgufReader>,
+        reader: &Arc<GgufReader>,
         info: &TensorInfo,
-    ) -> Result<TensorSnapshot, GgufError> {
+    ) -> Result<PackTensor, GgufError> {
         let conversion = self.conversion(info.tensor_type)?;
         let dtype = conversion.dtype(info.tensor_type);
         let shape = info.burn_shape();
@@ -189,30 +190,32 @@ impl GgufAdapter {
         let path = self
             .rename(&info.name, reader.architecture())
             .unwrap_or_else(|| info.name.clone());
-        let path_stack: Vec<String> = path.split('.').map(String::from).collect();
 
-        let reader = Rc::clone(reader);
+        let reader = Arc::clone(reader);
         let name = info.name.clone();
         let tensor_type = info.tensor_type;
         let closure_shape = shape.clone();
-        let data_fn = Rc::new(
-            move || -> Result<burn_tensor::TensorData, TensorSnapshotError> {
+        Ok(burn_store::bridge::deferred(
+            path,
+            dtype,
+            shape,
+            None,
+            move || -> Result<burn_tensor::TensorData, PackError> {
+                let invalid = |message: String| PackError::ValidationError(message);
                 let info = reader.tensor(&name).ok_or_else(|| {
-                    TensorSnapshotError::DataError(format!("tensor '{name}' is no longer present"))
+                    invalid(format!("tensor '{name}' is no longer present"))
                 })?;
                 let bytes = reader
                     .tensor_bytes(info)
-                    .map_err(|error| TensorSnapshotError::IoError(format!("{error}")))?;
+                    .map_err(|error| invalid(format!("{error}")))?;
 
                 match conversion {
                     Conversion::NativeQuantized => {
                         let scheme = tensor_type.to_quant_scheme().ok_or_else(|| {
-                            TensorSnapshotError::DataError(format!(
-                                "{tensor_type} has no packed conversion"
-                            ))
+                            invalid(format!("{tensor_type} has no packed conversion"))
                         })?;
                         let packed = repack_to_burn(tensor_type, &bytes, scheme, num_elements)
-                            .map_err(|error| TensorSnapshotError::DataError(format!("{error}")))?;
+                            .map_err(|error| invalid(format!("{error}")))?;
                         // The dtype carries the scheme, and it is what tells the backend where
                         // to split this blob into values and scales, so it is passed straight
                         // through rather than restated here.
@@ -224,20 +227,11 @@ impl GgufAdapter {
                     }
                     Conversion::Dequantized(_) => {
                         let values = dequantize_checked(tensor_type, &bytes, num_elements)
-                            .map_err(|error| TensorSnapshotError::DataError(format!("{error}")))?;
+                            .map_err(|error| invalid(format!("{error}")))?;
                         Ok(burn_tensor::TensorData::new(values, closure_shape.clone()))
                     }
                 }
             },
-        );
-
-        Ok(TensorSnapshot::from_closure(
-            data_fn,
-            dtype,
-            shape,
-            path_stack,
-            Vec::new(),
-            burn_core::module::ParamId::new(),
         ))
     }
 }
@@ -296,19 +290,19 @@ fn rewrite_layer_prefix(name: &str) -> Option<String> {
     }
 }
 
-/// A [`ModuleAdapter`](burn_store::ModuleAdapter) wrapper, for composing with other stores.
+/// A [`ModuleAdapter`] wrapper, for composing with other stores.
 ///
 /// This is mostly useful for documentation and for callers that want to plug a GGUF load
 /// into a chain that also renames tensors; [`GgufStore`](crate::GgufStore) applies this
 /// adapter itself, so most callers never need it.
-impl burn_store::ModuleAdapter for GgufAdapter {
-    fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
-        // Nothing to do: the conversion and renaming happen in `snapshot`, which already
+impl ModuleAdapter for GgufAdapter {
+    fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
+        // Nothing to do: the conversion and renaming happen in `tensor`, which already
         // knows the tensor's GGUF type. This method only exists to satisfy the trait.
-        snapshot.clone()
+        tensor
     }
 
-    fn clone_box(&self) -> Box<dyn burn_store::ModuleAdapter> {
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
         Box::new(self.clone())
     }
 }
@@ -316,7 +310,7 @@ impl burn_store::ModuleAdapter for GgufAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_tensor::quantization::{QuantScheme, QuantValue};
+    use burn_tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 
     #[test]
     fn should_map_the_standardized_names() {
@@ -489,9 +483,8 @@ mod tests {
             DType::QFloat(
                 QuantScheme::default()
                     .with_value(QuantValue::Q8F)
-                    .with_store(burn_tensor::quantization::QuantStore::Native)
-                    .with_level(burn_tensor::quantization::QuantLevel::block([32]))
-                    .with_param(burn_tensor::quantization::QuantParam::F16)
+                    .with_store(QuantStore::Native)
+                    .per_block([32], ScaleDtype::F16)
             )
         );
         assert_eq!(

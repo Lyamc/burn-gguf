@@ -2,10 +2,11 @@
 
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use burn_store::{ApplyResult, ModuleSnapshot, ModuleStore, PathFilter, TensorSnapshot};
+use burn_store::burn_pack::Tensor as PackTensor;
+use burn_store::{ApplyResult, ModuleSnapshot, ModuleStore, PathFilter};
 use burn_tensor::DType;
 
 use crate::adapter::{Conversion, GgufAdapter};
@@ -57,7 +58,7 @@ impl From<GgufError> for GgufStoreError {
 /// ```no_run
 /// # use burn_gguf::GgufStore;
 /// # fn load(
-/// #     model: &mut burn_nn::Linear<burn_flex::Flex>,
+/// #     model: &mut burn_nn::Linear,
 /// #     path: &str,
 /// # ) -> Result<(), burn_gguf::GgufStoreError> {
 /// let mut store = GgufStore::from_file(path)?;
@@ -68,12 +69,12 @@ impl From<GgufError> for GgufStoreError {
 /// # Memory
 ///
 /// Descriptors are parsed eagerly, which costs microseconds for a model with thousands of
-/// tensors. Payloads are produced inside the snapshot's data closure, so a parameter the
+/// tensors. Payloads are produced inside the tensor's data closure, so a parameter the
 /// module never visits is never decoded. With the default `memmap` feature the bytes a
 /// tensor *does* need are a subslice of the mapping rather than a copy.
 #[derive(Debug)]
 pub struct GgufStore {
-    reader: Rc<GgufReader>,
+    reader: Arc<GgufReader>,
     adapter: GgufAdapter,
     /// Which parameters to touch. `None` means all of them.
     filter: PathFilter,
@@ -82,7 +83,7 @@ pub struct GgufStore {
     /// Whether dtype or shape disagreements count as failures.
     validate: bool,
     /// Descriptors, built on first use and reused afterwards.
-    snapshots: Option<BTreeMap<String, TensorSnapshot>>,
+    snapshots: Option<BTreeMap<String, PackTensor>>,
 }
 
 impl GgufStore {
@@ -106,7 +107,7 @@ impl GgufStore {
     /// Wrap a reader with default settings.
     pub fn new(reader: GgufReader) -> Self {
         Self {
-            reader: Rc::new(reader),
+            reader: Arc::new(reader),
             adapter: GgufAdapter::new(),
             filter: PathFilter::none(),
             allow_partial: true,
@@ -187,13 +188,14 @@ impl GgufStore {
 
         let mut snapshots = BTreeMap::new();
         for info in self.reader.tensors() {
-            let snapshot = self.adapter.snapshot(&self.reader, info).map_err(|error| {
+            let tensor = self.adapter.tensor(&self.reader, info).map_err(|error| {
                 GgufStoreError::Conversion {
                     name: info.name.clone(),
                     message: format!("{error}"),
                 }
             })?;
-            snapshots.insert(snapshot.full_path(), snapshot);
+            let name = tensor.name.clone();
+            snapshots.insert(name, tensor);
         }
         self.snapshots = Some(snapshots);
         Ok(())
@@ -203,12 +205,11 @@ impl GgufStore {
     ///
     /// Equivalent to [`ModuleStore::load_from`], spelled out so callers do not have to
     /// import the trait for the common case.
-    pub fn load_into<B, M>(&mut self, module: &mut M) -> Result<ApplyResult, GgufStoreError>
+    pub fn load_into<M>(&mut self, module: &mut M) -> Result<ApplyResult, GgufStoreError>
     where
-        B: burn_tensor::backend::Backend,
-        M: ModuleSnapshot<B>,
+        M: ModuleSnapshot,
     {
-        ModuleStore::apply_to::<B, M>(self, module)
+        ModuleStore::apply_to(self, module)
     }
 
     /// Add a tensor path rewrite, applied after the built-in GGUF naming rules.
@@ -261,24 +262,19 @@ impl ModuleStore for GgufStore {
     type Error = GgufStoreError;
 
     /// Always fails: GGUF is an interchange format, not somewhere Burn writes models.
-    fn collect_from<B, M>(&mut self, _module: &M) -> Result<(), Self::Error>
-    where
-        B: burn_tensor::backend::Backend,
-        M: ModuleSnapshot<B>,
-    {
+    fn collect_from<M: ModuleSnapshot>(&mut self, _module: &M) -> Result<(), Self::Error> {
         Err(GgufStoreError::Config(
             "GGUF is a read-only interchange format; use burn-store to save a model".into(),
         ))
     }
 
     /// Replace the module's parameters with the file's tensors.
-    fn apply_to<B, M>(&mut self, module: &mut M) -> Result<ApplyResult, Self::Error>
-    where
-        B: burn_tensor::backend::Backend,
-        M: ModuleSnapshot<B>,
-    {
+    fn apply_to<M: ModuleSnapshot>(
+        &mut self,
+        module: &mut M,
+    ) -> Result<ApplyResult, Self::Error> {
         self.ensure_snapshots()?;
-        let snapshots: Vec<TensorSnapshot> = self
+        let snapshots: Vec<PackTensor> = self
             .snapshots
             .as_ref()
             .expect("just populated")
@@ -308,12 +304,12 @@ impl ModuleStore for GgufStore {
         Ok(result)
     }
 
-    fn get_snapshot(&mut self, name: &str) -> Result<Option<&TensorSnapshot>, Self::Error> {
+    fn get_tensor(&mut self, name: &str) -> Result<Option<&PackTensor>, Self::Error> {
         self.ensure_snapshots()?;
         Ok(self.snapshots.as_ref().and_then(|all| all.get(name)))
     }
 
-    fn get_all_snapshots(&mut self) -> Result<&BTreeMap<String, TensorSnapshot>, Self::Error> {
+    fn get_all_tensors(&mut self) -> Result<&BTreeMap<String, PackTensor>, Self::Error> {
         self.ensure_snapshots()?;
         Ok(self
             .snapshots
@@ -402,13 +398,11 @@ mod tests {
 
     #[test]
     fn should_refuse_to_save() {
-        type TestBackend = burn_flex::Flex;
-
         let mut store = store_from(sample());
         // A real module, so the `ModuleStore` bounds are satisfied the way a caller would
         // satisfy them.
         let linear = burn_nn::LinearConfig::new(4, 4).init(&Default::default());
-        let error = store.collect_from::<TestBackend, _>(&linear).unwrap_err();
+        let error = store.collect_from(&linear).unwrap_err();
         assert!(matches!(error, GgufStoreError::Config(_)), "{error:?}");
         assert!(format!("{error}").contains("read-only"), "{error}");
     }
@@ -453,12 +447,12 @@ mod tests {
 
         // The descriptor builds fine, with a plain float dtype already decided.
         store.ensure_snapshots().unwrap();
-        let snapshot = store.get_snapshot("w").unwrap().unwrap();
+        let snapshot = store.get_tensor("w").unwrap().unwrap();
         assert_eq!(snapshot.shape.as_slice(), &[256]);
         assert_eq!(snapshot.dtype, DType::F32);
 
         // Reading the data fails, proving the work was deferred to that point.
-        assert!(snapshot.to_data().is_err());
+        assert!(burn_store::bridge::to_data(snapshot).is_err());
     }
 
     #[test]
@@ -471,7 +465,7 @@ mod tests {
         ));
         let mut store = store_from(writer.build());
         let snapshot = store
-            .get_snapshot("layers.0.self_attn.q_proj.weight")
+            .get_tensor("layers.0.self_attn.q_proj.weight")
             .unwrap()
             .unwrap();
         assert!(
@@ -499,13 +493,13 @@ mod tests {
         assert_eq!(expected.len(), 32);
 
         let mut store = store_from(bytes);
-        let snapshot = store.get_snapshot("w").unwrap().unwrap();
+        let snapshot = store.get_tensor("w").unwrap().unwrap();
         assert!(
             matches!(snapshot.dtype, DType::QFloat(_)),
             "Q8_0 should stay packed, got {:?}",
             snapshot.dtype
         );
-        let packed = snapshot.to_data().unwrap();
+        let packed = burn_store::bridge::to_data(snapshot).unwrap();
         let blob = packed.as_bytes();
 
         // The blob is `[values][scales]`: 32 bytes of `i8`, then 2 bytes of `f16`.
@@ -540,9 +534,9 @@ mod tests {
             crate::quant::dequantize(GgmlType::Q4_0, &payload, 32).expect("a full block decodes");
 
         let mut store = store_from(bytes);
-        let snapshot = store.get_snapshot("w").unwrap().unwrap();
+        let snapshot = store.get_tensor("w").unwrap().unwrap();
         assert!(matches!(snapshot.dtype, DType::QFloat(_)));
-        let packed = snapshot.to_data().unwrap();
+        let packed = burn_store::bridge::to_data(snapshot).unwrap();
         let blob = packed.as_bytes();
 
         // 32 four-bit values become 16 bytes, followed by a 2-byte `f16` scale.

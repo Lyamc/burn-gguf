@@ -2,11 +2,9 @@
 
 Native [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) loader for [Burn](https://github.com/tracel-ai/burn). It parses the container, renames tensors, and loads weights into Burn modules. It is not a model implementation.
 
-This crate was split out of the [Lyamc/burn](https://github.com/Lyamc/burn) fork. It targets Burn **0.21**.
+This crate was split out of the [Lyamc/burn](https://github.com/Lyamc/burn) fork. It targets Burn **0.22**.
 
-`Q8_0` and `Q4_0` stay packed, using Burn's `Q8F` and `Q4F` schemes with `f16` scales. The K-quant, IQ, and TQ types are dequantized to `f32`.
-
-Burn 0.21 treats every quantization scale as `f32`. Loading a packed `f16` scale into a module then reads past the parameter blob (`STATUS_HEAP_CORRUPTION` on Windows). The parser, the dequantizer, and the repack tests do not hit that path. Burn 0.22 stores the scale width as `ScaleDtype` and splits the blob correctly, but that renamed the quantization API, so this crate does not build against 0.22 yet.
+`Q8_0` and `Q4_0` stay packed, using Burn's `Q8F` and `Q4F` schemes with `f16` scales (`ScaleDtype::F16`, one scale per 32 values). The K-quant, IQ, and TQ types are dequantized to `f32`.
 
 ```toml
 [dependencies]

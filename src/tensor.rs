@@ -4,7 +4,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use burn_tensor::DType;
-use burn_tensor::quantization::{QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue};
+use burn_tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 
 use crate::base::{GgufError, MAX_TENSOR_DIMS};
 
@@ -291,16 +291,14 @@ impl GgmlType {
                     .with_value(QuantValue::Q8F)
                     // `Q8_0` is already one `i8` per value with no packing to undo.
                     .with_store(QuantStore::Native)
-                    .with_level(QuantLevel::block([32]))
-                    .with_param(QuantParam::F16),
+                    .per_block([32], ScaleDtype::F16),
             ),
             Self::Q4_0 => Some(
                 QuantScheme::default()
                     .with_value(QuantValue::Q4F)
                     // Burn packs 8 four-bit values per `u32`, GGUF packs 2 per byte.
                     .with_store(QuantStore::PackedU32(0))
-                    .with_level(QuantLevel::block([32]))
-                    .with_param(QuantParam::F16),
+                    .per_block([32], ScaleDtype::F16),
             ),
             _ => None,
         }
@@ -666,14 +664,20 @@ mod tests {
         let q8 = GgmlType::Q8_0.to_quant_scheme().expect("Q8_0 must map");
         assert_eq!(q8.value, QuantValue::Q8F);
         assert_eq!(q8.store, QuantStore::Native);
-        assert_eq!(q8.level, QuantLevel::block([32]));
-        assert_eq!(q8.param, QuantParam::F16);
+        assert_eq!(q8.scale_dtype(), ScaleDtype::F16);
+        assert_eq!(
+            q8.block_size().map(|size| size.num_blocks(&[32])),
+            Some(vec![1])
+        );
 
         let q4 = GgmlType::Q4_0.to_quant_scheme().expect("Q4_0 must map");
         assert_eq!(q4.value, QuantValue::Q4F);
         assert_eq!(q4.store, QuantStore::PackedU32(0));
-        assert_eq!(q4.level, QuantLevel::block([32]));
-        assert_eq!(q4.param, QuantParam::F16);
+        assert_eq!(q4.scale_dtype(), ScaleDtype::F16);
+        assert_eq!(
+            q4.block_size().map(|size| size.num_blocks(&[32])),
+            Some(vec![1])
+        );
     }
 
     #[test]

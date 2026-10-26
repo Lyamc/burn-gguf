@@ -5,13 +5,9 @@
 //! wrong parameter, under a name the module never visits, with a shape the module rejects.
 
 use burn::module::{Module, Param};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData, Tolerance};
-use burn_flex::Flex;
+use burn::tensor::{Device, Tensor, TensorData, Tolerance};
 use burn_gguf::{GgmlType, GgufAdapter, GgufStore, GgufWriter, TensorSpec};
 use burn_nn::{Embedding, EmbeddingConfig};
-
-type TestBackend = Flex;
 
 /// Hidden size, which has to be a multiple of 32 for the quantized formats.
 const D_IN: usize = 32;
@@ -24,16 +20,16 @@ const D_OUT: usize = 6;
 /// onto this field's `weight` without help; the second needs a rule because a Burn norm
 /// parameter is named `gamma` and a GGUF one is named `weight`.
 #[derive(Module, Debug)]
-struct Tiny<B: Backend> {
-    embedding: Embedding<B>,
-    norm: Param<Tensor<B, 1>>,
+struct Tiny {
+    embedding: Embedding,
+    norm: Param<Tensor<1>>,
     /// Never present in the file, so the loader's handling of a missing parameter can be
     /// checked without a second fixture.
-    extra: Param<Tensor<B, 1>>,
+    extra: Param<Tensor<1>>,
 }
 
-impl<B: Backend> Tiny<B> {
-    fn init(device: &B::Device) -> Self {
+impl Tiny {
+    fn init(device: &Device) -> Self {
         Self {
             // GGUF stores `token_embd.weight` as `[n_embd, n_vocab]`, which reverses into
             // `[n_vocab, n_embd]`, the layout an embedding weight already uses.
@@ -121,7 +117,7 @@ fn should_load_a_gguf_file_into_a_module() {
     write_gguf(&path);
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny::init(&device);
+    let mut model: Tiny = Tiny::init(&device);
     let before = model.embedding.weight.val().into_data();
 
     let mut store = load(&path);
@@ -132,7 +128,7 @@ fn should_load_a_gguf_file_into_a_module() {
     );
 
     let result = store
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect("applying the store succeeds");
 
     assert!(
@@ -157,19 +153,19 @@ fn should_load_a_quantized_weight_with_the_right_values() {
     write_gguf(&path);
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny::init(&device);
+    let mut model: Tiny = Tiny::init(&device);
     load(&path)
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect("applying the store succeeds");
 
     let weight = model.embedding.weight.val();
     // GGUF `[32, 6]` reversed is the embedding's `[6, 32]`.
-    assert_eq!(weight.shape().dims(), [D_OUT, D_IN]);
+    assert_eq!(weight.dims(), [D_OUT, D_IN]);
 
     // The weight arrived packed, so comparing it to floats means asking the backend to
     // unpack it. This is the step that would go wrong if the scales were sliced at the
     // wrong offset, and it is the same call `Linear` and `Embedding` make internally.
-    let expected = Tensor::<TestBackend, 2>::from_data(
+    let expected = Tensor::<2>::from_data(
         TensorData::new(expected_embedding(), [D_OUT, D_IN]),
         &device,
     );
@@ -186,9 +182,9 @@ fn should_load_an_unquantized_weight_unchanged() {
     write_gguf(&path);
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny::init(&device);
+    let mut model: Tiny = Tiny::init(&device);
     load(&path)
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect("applying the store succeeds");
 
     let expected: Vec<f32> = (0..D_IN)
@@ -208,9 +204,9 @@ fn should_report_a_tensor_the_module_does_not_use() {
     write_gguf(&path);
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny::init(&device);
+    let mut model: Tiny = Tiny::init(&device);
     let result = load(&path)
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect("applying the store succeeds");
 
     // The extra layer is not an error by default, but it is reported so a caller can see
@@ -232,9 +228,9 @@ fn should_report_a_parameter_the_file_does_not_contain() {
     write_gguf(&path);
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny::init(&device);
+    let mut model: Tiny = Tiny::init(&device);
     let result = load(&path)
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect("a missing parameter is not fatal by default");
 
     assert!(
@@ -252,10 +248,10 @@ fn should_fail_when_every_parameter_is_required_and_one_is_absent() {
     write_gguf(&path);
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny::init(&device);
+    let mut model: Tiny = Tiny::init(&device);
     let error = load(&path)
         .require_complete()
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect_err("a complete load rejects a file that is missing a parameter");
     let message = format!("{error}");
     assert!(message.contains("missing"), "{message}");
@@ -269,13 +265,13 @@ fn should_only_touch_the_paths_a_filter_selects() {
     write_gguf(&path);
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny::init(&device);
+    let mut model: Tiny = Tiny::init(&device);
     let before = model.norm.val().into_data();
 
     let mut store =
         load(&path).with_filter(burn_store::PathFilter::new().with_full_path("embedding.weight"));
     let result = store
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect("a filtered load succeeds");
 
     assert_eq!(result.applied, vec!["embedding.weight".to_string()]);
@@ -301,18 +297,18 @@ fn should_expand_a_format_burn_cannot_keep_packed() {
 
     // `Q4_K` needs an embedding of 256 inputs to fill a super-block.
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny {
+    let mut model: Tiny = Tiny {
         embedding: EmbeddingConfig::new(D_OUT, 256).init(&device),
         norm: Param::from_tensor(Tensor::ones([256], &device)),
         extra: Param::from_tensor(Tensor::ones([256], &device)),
     };
 
     load(&path)
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect("an expanded format still loads");
 
     // The shape was still honoured, which is the part that can silently go wrong.
-    assert_eq!(model.embedding.weight.val().shape().dims(), [D_OUT, 256]);
+    assert_eq!(model.embedding.weight.val().dims(), [D_OUT, 256]);
 }
 
 #[test]
@@ -328,7 +324,7 @@ fn should_refuse_an_expanded_format_in_strict_mode() {
     std::fs::write(&path, writer.build()).unwrap();
 
     let device = Default::default();
-    let mut model: Tiny<TestBackend> = Tiny {
+    let mut model: Tiny = Tiny {
         embedding: EmbeddingConfig::new(D_OUT, 256).init(&device),
         norm: Param::from_tensor(Tensor::ones([256], &device)),
         extra: Param::from_tensor(Tensor::ones([256], &device)),
@@ -338,7 +334,7 @@ fn should_refuse_an_expanded_format_in_strict_mode() {
         .expect("the file loads")
         .with_adapter(adapter())
         .strict()
-        .load_into::<TestBackend, _>(&mut model)
+        .load_into(&mut model)
         .expect_err("strict mode rejects a format it cannot keep packed");
     let message = format!("{error}");
     assert!(message.contains("Q4_K"), "{message}");
