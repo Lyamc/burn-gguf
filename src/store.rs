@@ -5,7 +5,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use burn_store::burn_pack::Tensor as PackTensor;
+use burn_store::StoreTensor as PackTensor;
 use burn_store::{ApplyResult, ModuleSnapshot, ModuleStore, PathFilter};
 use burn_tensor::DType;
 
@@ -195,7 +195,7 @@ impl GgufStore {
                 }
             })?;
             let name = tensor.name.clone();
-            snapshots.insert(name, tensor);
+            snapshots.insert(name, PackTensor::from(tensor));
         }
         self.snapshots = Some(snapshots);
         Ok(())

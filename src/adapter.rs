@@ -296,7 +296,7 @@ fn rewrite_layer_prefix(name: &str) -> Option<String> {
 /// into a chain that also renames tensors; [`GgufStore`](crate::GgufStore) applies this
 /// adapter itself, so most callers never need it.
 impl ModuleAdapter for GgufAdapter {
-    fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
+    fn adapt(&self, tensor: burn_store::StoreTensor, _ctx: ModuleContext<'_>) -> burn_store::StoreTensor {
         // Nothing to do: the conversion and renaming happen in `tensor`, which already
         // knows the tensor's GGUF type. This method only exists to satisfy the trait.
         tensor
