@@ -448,11 +448,11 @@ mod tests {
         // The descriptor builds fine, with a plain float dtype already decided.
         store.ensure_snapshots().unwrap();
         let snapshot = store.get_tensor("w").unwrap().unwrap();
-        assert_eq!(snapshot.shape.as_slice(), &[256]);
-        assert_eq!(snapshot.dtype, DType::F32);
+        assert_eq!(snapshot.shape(), &[256]);
+        assert_eq!(snapshot.dtype(), DType::F32);
 
         // Reading the data fails, proving the work was deferred to that point.
-        assert!(burn_store::bridge::to_data(snapshot).is_err());
+        assert!(snapshot.to_data().is_err());
     }
 
     #[test]
@@ -469,9 +469,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(snapshot.dtype, DType::QFloat(_)),
+            matches!(snapshot.dtype(), DType::QFloat(_)),
             "expected a quantized dtype, got {:?}",
-            snapshot.dtype
+            snapshot.dtype()
         );
     }
 
@@ -495,11 +495,11 @@ mod tests {
         let mut store = store_from(bytes);
         let snapshot = store.get_tensor("w").unwrap().unwrap();
         assert!(
-            matches!(snapshot.dtype, DType::QFloat(_)),
+            matches!(snapshot.dtype(), DType::QFloat(_)),
             "Q8_0 should stay packed, got {:?}",
-            snapshot.dtype
+            snapshot.dtype()
         );
-        let packed = burn_store::bridge::to_data(snapshot).unwrap();
+        let packed = snapshot.to_data().unwrap();
         let blob = packed.as_bytes();
 
         // The blob is `[values][scales]`: 32 bytes of `i8`, then 2 bytes of `f16`.
@@ -535,8 +535,8 @@ mod tests {
 
         let mut store = store_from(bytes);
         let snapshot = store.get_tensor("w").unwrap().unwrap();
-        assert!(matches!(snapshot.dtype, DType::QFloat(_)));
-        let packed = burn_store::bridge::to_data(snapshot).unwrap();
+        assert!(matches!(snapshot.dtype(), DType::QFloat(_)));
+        let packed = snapshot.to_data().unwrap();
         let blob = packed.as_bytes();
 
         // 32 four-bit values become 16 bytes, followed by a 2-byte `f16` scale.
